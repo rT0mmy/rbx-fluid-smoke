@@ -6,30 +6,30 @@ local Profiler = require(`@game/ReplicatedStorage/Modules/Shared/Profiler`)
 
 local Smoke = {}
 
-type Slot = {
+type Pool = {
+	Template: ParticleEmitter,
+	Version: number, -- the look Size, SizeTimes, SizeValues and Faded were built for
+	Size: NumberSequence,
+	SizeTimes: { number }, -- Size's keypoints as plain numbers, so a puff's size is read without touching the engine
+	SizeValues: { number },
+	Free: { Puff },
+	Faded: { [number]: NumberSequence }, -- [opacity step] = the look's Transparency at that opacity
+}
+
+--// A part with its emitter, and the puff it carries while in the air. Reused, so releasing a puff allocates nothing.
+type Puff = {
 	Part: BasePart,
 	Emitter: ParticleEmitter,
 	Version: number, -- the look its emitter is dressed in
 	Opacity: number, -- the step its emitter's Transparency is set to
-}
-
-type Pool = {
-	Template: ParticleEmitter,
-	Version: number, -- the look Size, SizeKeys and Faded were built for
-	Size: NumberSequence,
-	SizeKeys: { NumberSequenceKeypoint },
-	Free: { Slot },
-	Faded: { [number]: NumberSequence }, -- [opacity step] = the look's Transparency at that opacity
-}
-
-type Puff = {
-	Slot: Slot,
 	Pool: Pool,
 	Position: Vector3,
 	Velocity: Vector3,
 	Age: number,
 	Life: number,
 	Floor: number,
+	Swirl: Vector3?, -- the curl last sampled for it; nil until its first step
+	Phase: number, -- which frames it resamples the curl on
 }
 
 type Car = {
@@ -38,7 +38,11 @@ type Car = {
 	Half: Vector3,
 	HalfWidth: number,
 	HalfLength: number,
-	Frame: CFrame,
+	Position: Vector3, -- of the bounding box
+	XAxis: Vector3, -- the bounding box's axes, for measuring a point in its space with dot products
+	YAxis: Vector3,
+	ZAxis: Vector3,
+	ReachSquared: number, -- puffs further than this from Position are neither pushed nor in its wake
 	Velocity: Vector3,
 	Speed: number,
 	Heading: Vector3,
@@ -49,10 +53,16 @@ local random = Random.new()
 --// Opacity is applied in steps this coarse
 const OPACITY_STEPS = 16
 
+--// Each puff samples the curl every this many frames. Its velocity eases toward the air over about
+--// 1 / Drag seconds, so a swirl a frame old does not show, and it halves the noise calls.
+const SWIRL_EVERY = 2
+
 --// [template] = its pool
 local pools: { [ParticleEmitter]: Pool } = {}
 local puffs: { Puff } = {}
 local slotsMade = 0
+local released = 0
+local frame = 0
 local folder: Folder? = nil
 
 --// Bumped by Restyle
@@ -65,23 +75,26 @@ local moved: { BasePart } = {}
 local targets: { CFrame } = {}
 
 --[[
-	@param keys {NumberSequenceKeypoint}
+	A piecewise-linear curve's value at t
+
+	@param times {number} -- ascending
+	@param values {number}
 	@param t number -- 0..1
 	@return number
 --]]
-local function sample(keys: { NumberSequenceKeypoint }, t: number): number
-	for i = 2, #keys do
-		local b = keys[i]
+local function sample(times: { number }, values: { number }, t: number): number
+	for i = 2, #times do
+		local b = times[i]
 
-		if t <= b.Time then
-			local a = keys[i - 1]
-			local span = b.Time - a.Time
+		if t <= b then
+			local a = times[i - 1]
+			local span = b - a
 
-			return if span > 0 then a.Value + (b.Value - a.Value) * (t - a.Time) / span else b.Value
+			return if span > 0 then values[i - 1] + (values[i] - values[i - 1]) * (t - a) / span else values[i]
 		end
 	end
 
-	return keys[#keys].Value
+	return values[#values]
 end
 
 --[[
@@ -92,17 +105,23 @@ local function poolFor(template: ParticleEmitter): Pool
 	local pool = pools[template]
 
 	if not pool then
-		pool = { Template = template, Version = 0, Free = {}, Faded = {} }
+		pool = { Template = template, Version = 0, SizeTimes = {}, SizeValues = {}, Free = {}, Faded = {} }
 		pools[template] = pool
 	end
 
 	if pool.Version ~= version then
 		local look = Config.Smoke.Look
 
-		pool.Size = if look.UseTemplate
-			then template.Size
-			else NumberSequence.new(look.SizeStart, look.SizeEnd)
-		pool.SizeKeys = pool.Size.Keypoints
+		pool.Size = if look.UseTemplate then template.Size else NumberSequence.new(look.SizeStart, look.SizeEnd)
+
+		table.clear(pool.SizeTimes)
+		table.clear(pool.SizeValues)
+
+		for i, key in pool.Size.Keypoints do
+			pool.SizeTimes[i] = key.Time
+			pool.SizeValues[i] = key.Value
+		end
+
 		pool.Version = version
 		table.clear(pool.Faded)
 	end
@@ -114,9 +133,9 @@ end
 	A free part carrying the pool's emitter, or nil once MaxPuffs parts exist and none is free
 
 	@param pool Pool
-	@return Slot?
+	@return Puff?
 --]]
-local function slotFor(pool: Pool): Slot?
+local function slotFor(pool: Pool): Puff?
 	local slot = table.remove(pool.Free)
 	if slot then return slot end
 
@@ -151,17 +170,30 @@ local function slotFor(pool: Pool): Slot?
 	emitter.WindAffectsDrag = false
 	emitter.Parent = part
 
-	return { Part = part, Emitter = emitter, Version = 0, Opacity = -1 }
+	return {
+		Part = part,
+		Emitter = emitter,
+		Version = 0,
+		Opacity = -1,
+		Pool = pool,
+		Position = Vector3.zero,
+		Velocity = Vector3.zero,
+		Age = 0,
+		Life = 0,
+		Floor = 0,
+		Swirl = nil,
+		Phase = 0,
+	}
 end
 
 --[[
 	Puts a slot's emitter in the current look, if it is not already
 
-	@param slot Slot
+	@param slot Puff
 	@param pool Pool
 	@return nil
 --]]
-local function dress(slot: Slot, pool: Pool)
+local function dress(slot: Puff, pool: Pool)
 	if slot.Version == version then return end
 
 	local look = Config.Smoke.Look
@@ -237,16 +269,17 @@ local function curl(position: Vector3, time: number): Vector3
 	local cX = math.noise(x - 23.7 + e, y + 41.3, z - 7.1) - c
 	local cY = math.noise(x - 23.7, y + 41.3 + e, z - 7.1) - c
 
-	return Vector3.new(cY - bZ, aZ - cX, bX - aY) / e
+	return vector.create(cY - bZ, aZ - cX, bX - aY) / e
 end
 
 --[[
 	A car's body and motion this frame, measured once per car
 
 	@param host Host
+	@param wakeLength number -- studs
 	@return Car
 --]]
-local function carOf(host): Car
+local function carOf(host, wakeLength: number): Car
 	local car = cars[host]
 
 	if not car then
@@ -259,7 +292,11 @@ local function carOf(host): Car
 			Half = half,
 			HalfWidth = math.min(half.X, half.Z),
 			HalfLength = math.max(half.X, half.Z),
-			Frame = box,
+			Position = box.Position,
+			XAxis = box.XVector,
+			YAxis = box.YVector,
+			ZAxis = box.ZVector,
+			ReachSquared = 0,
 			Velocity = Vector3.zero,
 			Speed = 0,
 			Heading = Vector3.zero,
@@ -268,11 +305,18 @@ local function carOf(host): Car
 		cars[host] = car
 	end
 
-	car.Frame = car.Seat.CFrame * car.Offset
-	car.Velocity = car.Seat.AssemblyLinearVelocity
+	local box = car.Seat.CFrame * car.Offset
+	car.Position = box.Position
+	car.XAxis = box.XVector
+	car.YAxis = box.YVector
+	car.ZAxis = box.ZVector
+	car.ReachSquared = (car.HalfLength + wakeLength) ^ 2
 
-	local flat = Vector3.new(car.Velocity.X, 0, car.Velocity.Z)
-	car.Speed = flat.Magnitude
+	local velocity = car.Seat.AssemblyLinearVelocity
+	local flat = vector.create(velocity.X, 0, velocity.Z)
+
+	car.Velocity = velocity
+	car.Speed = vector.magnitude(flat)
 	car.Heading = if car.Speed > 1e-3 then flat / car.Speed else Vector3.zero
 
 	return car
@@ -293,33 +337,35 @@ function Smoke.Emit(template: ParticleEmitter, position: Vector3, velocity: Vect
 	if step == 0 then return end
 
 	local pool = poolFor(template)
-	local slot = slotFor(pool)
-	if not slot then return end
+	local puff = slotFor(pool)
+	if not puff then return end
 
-	dress(slot, pool)
+	dress(puff, pool)
 
-	if step ~= slot.Opacity then
-		slot.Emitter.Transparency = fadedFor(pool, step)
-		slot.Opacity = step
+	if step ~= puff.Opacity then
+		puff.Emitter.Transparency = fadedFor(pool, step)
+		puff.Opacity = step
 	end
 
 	local lifetime = Config.Smoke.Look.Lifetime or template.Lifetime
 	local life = random:NextNumber(lifetime.Min, lifetime.Max)
 
 	--// The particle has to die exactly when the puff frees its part, or it would be dragged into the next puff's spot
-	slot.Emitter.Lifetime = NumberRange.new(life)
-	slot.Part.CFrame = CFrame.new(position)
-	slot.Emitter:Emit(1)
+	puff.Emitter.Lifetime = NumberRange.new(life)
+	puff.Part.CFrame = CFrame.new(position)
+	puff.Emitter:Emit(1)
 
-	table.insert(puffs, {
-		Slot = slot,
-		Pool = pool,
-		Position = position,
-		Velocity = velocity,
-		Age = 0,
-		Life = life,
-		Floor = floor,
-	})
+	released += 1
+
+	puff.Position = position
+	puff.Velocity = velocity
+	puff.Age = 0
+	puff.Life = life
+	puff.Floor = floor
+	puff.Swirl = nil
+	puff.Phase = released % SWIRL_EVERY
+
+	table.insert(puffs, puff)
 end
 
 --[[
@@ -337,16 +383,20 @@ function Smoke.Step(deltaTime: number, hosts)
 	local settings = Config.Smoke
 	local time = os.clock() * settings.NoiseDrift
 	local follow = 1 - math.exp(-settings.Drag * deltaTime)
+	local margin = settings.PushMargin
+
+	frame += 1
 
 	table.clear(nearby)
 
 	for _, host in hosts do
-		table.insert(nearby, carOf(host))
+		table.insert(nearby, carOf(host, settings.WakeLength))
 	end
 
 	table.clear(moved)
 	table.clear(targets)
 
+	local count = 0
 	local index = 1
 
 	while index <= #puffs do
@@ -354,7 +404,7 @@ function Smoke.Step(deltaTime: number, hosts)
 		puff.Age += deltaTime
 
 		if puff.Age >= puff.Life then
-			table.insert(puff.Pool.Free, puff.Slot)
+			table.insert(puff.Pool.Free, puff)
 			puffs[index] = puffs[#puffs]
 			puffs[#puffs] = nil
 			continue
@@ -363,42 +413,42 @@ function Smoke.Step(deltaTime: number, hosts)
 		local t = puff.Age / puff.Life
 		local position = puff.Position
 		local churn = 1
-		local air = Vector3.new(0, settings.Rise * (1 - t), 0)
+		local air = vector.create(0, settings.Rise * (1 - t), 0)
 
 		for _, car in nearby do
-			local offset = position - car.Frame.Position
-			local reach = car.HalfLength + settings.WakeLength
+			local offset = position - car.Position
 
-			if offset.Magnitude > reach then continue end
+			if vector.dot(offset, offset) > car.ReachSquared then continue end
 
-			local spot = car.Frame:PointToObjectSpace(position)
+			local spotX = vector.dot(offset, car.XAxis)
+			local spotY = vector.dot(offset, car.YAxis)
+			local spotZ = vector.dot(offset, car.ZAxis)
 			local half = car.Half
-			local margin = settings.PushMargin
-			local overX = half.X + margin - math.abs(spot.X)
-			local overY = half.Y + margin - math.abs(spot.Y)
-			local overZ = half.Z + margin - math.abs(spot.Z)
+			local overX = half.X + margin - math.abs(spotX)
+			local overY = half.Y + margin - math.abs(spotY)
+			local overZ = half.Z + margin - math.abs(spotZ)
 
 			if overX > 0 and overY > 0 and overZ > 0 then
 				local out = if overX <= overY and overX <= overZ
-					then Vector3.xAxis * math.sign(spot.X)
-					elseif overY <= overZ then Vector3.yAxis * math.sign(spot.Y)
-					else Vector3.zAxis * math.sign(spot.Z)
+					then car.XAxis * math.sign(spotX)
+					elseif overY <= overZ then car.YAxis * math.sign(spotY)
+					else car.ZAxis * math.sign(spotZ)
 
-				air += car.Frame:VectorToWorldSpace(out) * (settings.PushSpeed + car.Speed * settings.PushCarry)
+				air += out * (settings.PushSpeed + car.Speed * settings.PushCarry)
 			end
 
 			if car.Speed < settings.WakeMinSpeed then continue end
 
 			--// Measured from the rear along the way the car is moving, not the way it faces, so a drift's wake trails its slide
-			local along = offset:Dot(car.Heading)
+			local along = vector.dot(offset, car.Heading)
 			local behind = -along - car.HalfLength
 			if behind < -2 * car.HalfLength or behind > settings.WakeLength then continue end
 
 			local side = offset - car.Heading * along
-			side = Vector3.new(side.X, 0, side.Z)
+			side = vector.create(side.X, 0, side.Z)
 
 			local width = car.HalfWidth * settings.WakeWidth
-			local across = side.Magnitude
+			local across = vector.magnitude(side)
 			if across >= width then continue end
 
 			local strength = (1 - math.max(behind, 0) / settings.WakeLength) * (1 - across / width)
@@ -407,23 +457,32 @@ function Smoke.Step(deltaTime: number, hosts)
 			churn += settings.WakeChurn * strength * math.min(car.Speed / settings.WakeChurnSpeed, 1)
 		end
 
-		air += curl(position, time) * (settings.Swirl * churn)
+		local swirl = puff.Swirl
+
+		if not swirl or (frame + puff.Phase) % SWIRL_EVERY == 0 then
+			swirl = curl(position, time)
+			puff.Swirl = swirl
+		end
+
+		air += swirl * (settings.Swirl * churn)
 
 		local velocity = puff.Velocity + (air - puff.Velocity) * follow
 		position += velocity * deltaTime
 
-		local floor = puff.Floor + sample(puff.Pool.SizeKeys, t) / 2 * settings.FloorHold
+		local pool = puff.Pool
+		local floor = puff.Floor + sample(pool.SizeTimes, pool.SizeValues, t) / 2 * settings.FloorHold
 
 		if position.Y < floor then
-			position = Vector3.new(position.X, floor, position.Z)
-			if velocity.Y < 0 then velocity = Vector3.new(velocity.X, 0, velocity.Z) end
+			position = vector.create(position.X, floor, position.Z)
+			if velocity.Y < 0 then velocity = vector.create(velocity.X, 0, velocity.Z) end
 		end
 
 		puff.Position = position
 		puff.Velocity = velocity
 
-		table.insert(moved, puff.Slot.Part)
-		table.insert(targets, CFrame.new(position))
+		count += 1
+		moved[count] = puff.Part
+		targets[count] = CFrame.new(position)
 
 		index += 1
 	end
@@ -449,8 +508,8 @@ end
 --]]
 function Smoke.Clear()
 	for _, puff in puffs do
-		puff.Slot.Emitter:Clear()
-		table.insert(puff.Pool.Free, puff.Slot)
+		puff.Emitter:Clear()
+		table.insert(puff.Pool.Free, puff)
 	end
 
 	table.clear(puffs)
