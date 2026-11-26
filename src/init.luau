@@ -1,10 +1,30 @@
 --!nonstrict
 --!native
 
-local Config = require(`./Config`)
-local Profiler = require(`@game/ReplicatedStorage/Modules/Shared/Profiler`)
+--[[
+Smoke that drifts like a fluid: each puff is one particle on a pooled, code-moved part, carried by
+curl noise, dragged along in the wake of moving bodies and pushed out of them.
+
+	Smoke.UseConfig(mySettings) -- optional; Smoke.Config otherwise
+
+	RunService.RenderStepped:Connect(function(deltaTime)
+		Smoke.Step(deltaTime, { { Model = car, Root = car.PrimaryPart } })
+	end)
+
+	Smoke.Emit(template, position, velocity, groundHeight, 0.8)
+]]
+
+local Defaults = require(`@self/Config`)
 
 local Smoke = {}
+
+export type Body = {
+	Model: Model, -- its bounding box is what pushes smoke aside
+	Root: BasePart, -- moves with the model; its velocity drives the wake
+}
+
+--// The settings in use; Smoke.UseConfig swaps in a game's own table
+local Config = Defaults
 
 type Pool = {
 	Template: ParticleEmitter,
@@ -32,9 +52,9 @@ type Puff = {
 	Phase: number, -- which frames it resamples the curl on
 }
 
-type Car = {
-	Seat: BasePart,
-	Offset: CFrame, -- bounding box in the seat's space
+type Mover = {
+	Root: BasePart,
+	Offset: CFrame, -- bounding box in Root's space
 	Half: Vector3,
 	HalfWidth: number,
 	HalfLength: number,
@@ -68,8 +88,8 @@ local folder: Folder? = nil
 --// Bumped by Restyle
 local version = 1
 
-local cars: { [any]: Car } = setmetatable({}, { __mode = 'k' })
-local nearby: { Car } = {}
+local movers: { [any]: Mover } = setmetatable({} :: any, { __mode = 'k' })
+local nearby: { Mover } = {}
 
 local moved: { BasePart } = {}
 local targets: { CFrame } = {}
@@ -110,7 +130,7 @@ local function poolFor(template: ParticleEmitter): Pool
 	end
 
 	if pool.Version ~= version then
-		local look = Config.Smoke.Look
+		local look = Config.Look
 
 		pool.Size = if look.UseTemplate then template.Size else NumberSequence.new(look.SizeStart, look.SizeEnd)
 
@@ -139,13 +159,14 @@ local function slotFor(pool: Pool): Puff?
 	local slot = table.remove(pool.Free)
 	if slot then return slot end
 
-	if slotsMade >= Config.Smoke.MaxPuffs then return nil end
+	if slotsMade >= Config.MaxPuffs then return nil end
 	slotsMade += 1
 
 	if not folder then
-		folder = Instance.new('Folder')
-		folder.Name = '_Smoke'
-		folder.Parent = workspace
+		local made = Instance.new('Folder')
+		made.Name = Config.FolderName
+		made.Parent = workspace
+		folder = made
 	end
 
 	local part = Instance.new('Part')
@@ -196,7 +217,7 @@ end
 local function dress(slot: Puff, pool: Pool)
 	if slot.Version == version then return end
 
-	local look = Config.Smoke.Look
+	local look = Config.Look
 	local template = pool.Template
 	local emitter = slot.Emitter
 
@@ -221,7 +242,7 @@ local function fadedFor(pool: Pool, step: number): NumberSequence
 	local faded = pool.Faded[step]
 	if faded then return faded end
 
-	local look = Config.Smoke.Look
+	local look = Config.Look
 	local scale = step / OPACITY_STEPS
 
 	if look.UseTemplate then
@@ -254,7 +275,7 @@ end
 	@return Vector3
 --]]
 local function curl(position: Vector3, time: number): Vector3
-	local scale = Config.Smoke.NoiseScale
+	local scale = Config.NoiseScale
 	local x, y, z = position.X * scale + time, position.Y * scale - time, position.Z * scale
 	local e = 0.1
 
@@ -273,22 +294,22 @@ local function curl(position: Vector3, time: number): Vector3
 end
 
 --[[
-	A car's body and motion this frame, measured once per car
+	A body's box and motion this frame, measured once per body
 
-	@param host Host
+	@param body Body
 	@param wakeLength number -- studs
-	@return Car
+	@return Mover
 --]]
-local function carOf(host, wakeLength: number): Car
-	local car = cars[host]
+local function moverOf(body, wakeLength: number): Mover
+	local mover = movers[body]
 
-	if not car then
-		local box, size = host.Model:GetBoundingBox()
+	if not mover then
+		local box, size = body.Model:GetBoundingBox()
 		local half = size / 2
 
-		car = {
-			Seat = host.Seat,
-			Offset = host.Seat.CFrame:ToObjectSpace(box),
+		mover = {
+			Root = body.Root,
+			Offset = body.Root.CFrame:ToObjectSpace(box),
 			Half = half,
 			HalfWidth = math.min(half.X, half.Z),
 			HalfLength = math.max(half.X, half.Z),
@@ -302,30 +323,30 @@ local function carOf(host, wakeLength: number): Car
 			Heading = Vector3.zero,
 		}
 
-		cars[host] = car
+		movers[body] = mover
 	end
 
-	local box = car.Seat.CFrame * car.Offset
-	car.Position = box.Position
-	car.XAxis = box.XVector
-	car.YAxis = box.YVector
-	car.ZAxis = box.ZVector
-	car.ReachSquared = (car.HalfLength + wakeLength) ^ 2
+	local box = mover.Root.CFrame * mover.Offset
+	mover.Position = box.Position
+	mover.XAxis = box.XVector
+	mover.YAxis = box.YVector
+	mover.ZAxis = box.ZVector
+	mover.ReachSquared = (mover.HalfLength + wakeLength) ^ 2
 
-	local velocity = car.Seat.AssemblyLinearVelocity
+	local velocity = mover.Root.AssemblyLinearVelocity
 	local flat = vector.create(velocity.X, 0, velocity.Z)
 
-	car.Velocity = velocity
-	car.Speed = vector.magnitude(flat)
-	car.Heading = if car.Speed > 1e-3 then flat / car.Speed else Vector3.zero
+	mover.Velocity = velocity
+	mover.Speed = vector.magnitude(flat)
+	mover.Heading = if mover.Speed > 1e-3 then flat / mover.Speed else Vector3.zero
 
-	return car
+	return mover
 end
 
 --[[
 	Releases one puff from a template, at a point on the ground
 
-	@param template ParticleEmitter -- shapes the puff, with Config.Smoke.Look over it
+	@param template ParticleEmitter -- shapes the puff, with Config.Look over it
 	@param position Vector3
 	@param velocity Vector3
 	@param floor number -- height of the ground it came off
@@ -347,7 +368,7 @@ function Smoke.Emit(template: ParticleEmitter, position: Vector3, velocity: Vect
 		puff.Opacity = step
 	end
 
-	local lifetime = Config.Smoke.Look.Lifetime or template.Lifetime
+	local lifetime = Config.Look.Lifetime or template.Lifetime
 	local life = random:NextNumber(lifetime.Min, lifetime.Max)
 
 	--// The particle has to die exactly when the puff frees its part, or it would be dragged into the next puff's spot
@@ -372,15 +393,15 @@ end
 	Moves every puff through the air one frame
 
 	@param deltaTime number
-	@param hosts {[Model]: Host} -- every car in effects range; each one stirs the air
+	@param bodies {[any]: Body}? -- everything that stirs the air: pushes smoke out of its box and drags a wake
 	@return nil
 --]]
-function Smoke.Step(deltaTime: number, hosts)
+function Smoke.Step(deltaTime: number, bodies: { [any]: Body }?)
 	if #puffs == 0 then return end
 
-	Profiler.Begin('Smoke')
+	Config.Profiler.Begin('Smoke')
 
-	local settings = Config.Smoke
+	local settings = Config
 	local time = os.clock() * settings.NoiseDrift
 	local follow = 1 - math.exp(-settings.Drag * deltaTime)
 	local margin = settings.PushMargin
@@ -389,8 +410,10 @@ function Smoke.Step(deltaTime: number, hosts)
 
 	table.clear(nearby)
 
-	for _, host in hosts do
-		table.insert(nearby, carOf(host, settings.WakeLength))
+	if bodies then
+		for _, body in bodies do
+			table.insert(nearby, moverOf(body, settings.WakeLength))
+		end
 	end
 
 	table.clear(moved)
@@ -415,46 +438,46 @@ function Smoke.Step(deltaTime: number, hosts)
 		local churn = 1
 		local air = vector.create(0, settings.Rise * (1 - t), 0)
 
-		for _, car in nearby do
-			local offset = position - car.Position
+		for _, mover in nearby do
+			local offset = position - mover.Position
 
-			if vector.dot(offset, offset) > car.ReachSquared then continue end
+			if vector.dot(offset, offset) > mover.ReachSquared then continue end
 
-			local spotX = vector.dot(offset, car.XAxis)
-			local spotY = vector.dot(offset, car.YAxis)
-			local spotZ = vector.dot(offset, car.ZAxis)
-			local half = car.Half
+			local spotX = vector.dot(offset, mover.XAxis)
+			local spotY = vector.dot(offset, mover.YAxis)
+			local spotZ = vector.dot(offset, mover.ZAxis)
+			local half = mover.Half
 			local overX = half.X + margin - math.abs(spotX)
 			local overY = half.Y + margin - math.abs(spotY)
 			local overZ = half.Z + margin - math.abs(spotZ)
 
 			if overX > 0 and overY > 0 and overZ > 0 then
 				local out = if overX <= overY and overX <= overZ
-					then car.XAxis * math.sign(spotX)
-					elseif overY <= overZ then car.YAxis * math.sign(spotY)
-					else car.ZAxis * math.sign(spotZ)
+					then mover.XAxis * math.sign(spotX)
+					elseif overY <= overZ then mover.YAxis * math.sign(spotY)
+					else mover.ZAxis * math.sign(spotZ)
 
-				air += out * (settings.PushSpeed + car.Speed * settings.PushCarry)
+				air += out * (settings.PushSpeed + mover.Speed * settings.PushCarry)
 			end
 
-			if car.Speed < settings.WakeMinSpeed then continue end
+			if mover.Speed < settings.WakeMinSpeed then continue end
 
-			--// Measured from the rear along the way the car is moving, not the way it faces, so a drift's wake trails its slide
-			local along = vector.dot(offset, car.Heading)
-			local behind = -along - car.HalfLength
-			if behind < -2 * car.HalfLength or behind > settings.WakeLength then continue end
+			--// Measured from the rear along the way the body is moving, not the way it faces, so a drift's wake trails its slide
+			local along = vector.dot(offset, mover.Heading)
+			local behind = -along - mover.HalfLength
+			if behind < -2 * mover.HalfLength or behind > settings.WakeLength then continue end
 
-			local side = offset - car.Heading * along
+			local side = offset - mover.Heading * along
 			side = vector.create(side.X, 0, side.Z)
 
-			local width = car.HalfWidth * settings.WakeWidth
+			local width = mover.HalfWidth * settings.WakeWidth
 			local across = vector.magnitude(side)
 			if across >= width then continue end
 
 			local strength = (1 - math.max(behind, 0) / settings.WakeLength) * (1 - across / width)
 
-			air += car.Velocity * (settings.WakeCarry * strength) - side * (settings.WakeConverge * strength)
-			churn += settings.WakeChurn * strength * math.min(car.Speed / settings.WakeChurnSpeed, 1)
+			air += mover.Velocity * (settings.WakeCarry * strength) - side * (settings.WakeConverge * strength)
+			churn += settings.WakeChurn * strength * math.min(mover.Speed / settings.WakeChurnSpeed, 1)
 		end
 
 		local swirl = puff.Swirl
@@ -489,11 +512,11 @@ function Smoke.Step(deltaTime: number, hosts)
 
 	workspace:BulkMoveTo(moved, targets, Enum.BulkMoveMode.FireCFrameChanged)
 
-	Profiler.End()
+	Config.Profiler.End()
 end
 
 --[[
-	Picks up changes to Config.Smoke.Look; puffs already in the air keep the look they left with
+	Picks up changes to Config.Look; puffs already in the air keep the look they left with
 
 	@return nil
 --]]
@@ -517,10 +540,48 @@ end
 
 --[[
 	@return number -- puffs in the air
-	@return number -- parts made for them so far, against Config.Smoke.MaxPuffs
+	@return number -- parts made for them so far, against Config.MaxPuffs
 --]]
 function Smoke.Stats(): (number, number)
 	return #puffs, slotsMade
 end
+
+--[[
+	Copies every key `target` lacks from `source`, tables included
+
+	@param target {[string]: any}
+	@param source {[string]: any}
+	@return {[string]: any} -- target
+--]]
+local function fill(target, source)
+	for key, value in source do
+		local own = target[key]
+
+		if own == nil then
+			target[key] = if type(value) == 'table' then fill({}, value) else value
+		elseif type(own) == 'table' and type(value) == 'table' then
+			fill(own, value)
+		end
+	end
+
+	return target
+end
+
+--[[
+	Reads settings from the game's own table from now on, so the game can tune and edit them live.
+	Keys it lacks are filled in from the defaults, and keys Smoke does not know are left alone.
+
+	@param settings {[string]: any}
+	@return nil
+--]]
+function Smoke.UseConfig(settings)
+	Config = fill(settings, Defaults)
+	Smoke.Config = Config
+
+	Smoke.Restyle()
+end
+
+--// The settings in use, read live
+Smoke.Config = Config
 
 return Smoke

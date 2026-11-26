@@ -1,0 +1,10 @@
+[package]
+name = "rt0mmy/live-smoke"
+description = "Fluid-looking smoke for Roblox: pooled particle puffs carried by curl noise, body wakes and collisions"
+version = "0.1.0"
+authors = ["rT0mmy"]
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+include = ["src", "src/**", "default.project.json", "wally.toml", "README.md"]
+
+[dependencies]
